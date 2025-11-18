@@ -314,10 +314,21 @@ async def chat_endpoint(payload: ChatRequest):
     return call_openai_chat(payload, partner_name)
 
 
-@app.post("/translate-word", response_model=TranslateResponse)
-async def translate_word_endpoint(payload: TranslateRequest):
+def _perform_translation(payload: TranslateRequest) -> TranslateResponse:
     lang = payload.language or "English"
     return call_openai_translate(lang, payload.word)
+
+
+@app.post("/translate-word", response_model=TranslateResponse)
+async def translate_word_endpoint(payload: TranslateRequest):
+    return _perform_translation(payload)
+
+
+@app.post("/translate_word", response_model=TranslateResponse)
+async def translate_word_endpoint_legacy(payload: TranslateRequest):
+    """Совместимость со старым фронтендом, который использует underscore."""
+
+    return _perform_translation(payload)
 
 
 # ---------- Локальный запуск ----------
