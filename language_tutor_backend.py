@@ -48,6 +48,7 @@ class TranslateRequest(BaseModel):
 class TranslateResponse(BaseModel):
     translation: str
     example: str
+    example_translation: str
 
 
 # ---------- Вспомогательные функции ----------
@@ -227,14 +228,16 @@ def call_openai_translate(language: str, word: str) -> TranslateResponse:
 
     system_prompt = f"""
 You are a translator.
-Your task: translate ONE word or a very short phrase from {language} to Russian
-and give ONE short example sentence in {language} with this word.
+Your task: translate ONE word or a very short phrase from {language} to Russian,
+give ONE short example sentence in {language} with this word,
+and ALSO translate that example sentence to Russian.
 
 Answer STRICTLY as JSON, without any extra text:
 
 {{
   "translation": "перевод на русский",
-  "example": "short example sentence in {language} with this word"
+  "example": "short example sentence in {language} with this word",
+  "example_translation": "перевод примера на русский"
 }}
 """.strip()
 
@@ -251,19 +254,29 @@ Answer STRICTLY as JSON, without any extra text:
 
     translation = ""
     example = ""
+    example_translation = ""
     try:
         data = json.loads(content)
         translation = str(data.get("translation", "")).strip()
         example = str(data.get("example", "")).strip()
+        example_translation = str(data.get("example_translation", "")).strip()
     except Exception:
         # fallback: просто отдать весь текст в перевод
         translation = content.strip()
         example = ""
+        example_translation = ""
 
     if not translation:
         translation = word
 
-    return TranslateResponse(translation=translation, example=example)
+    if not example_translation and example:
+        example_translation = translation
+
+    return TranslateResponse(
+        translation=translation,
+        example=example,
+        example_translation=example_translation,
+    )
 
 
 # ---------- FastAPI приложение ----------
