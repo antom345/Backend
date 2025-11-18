@@ -48,6 +48,7 @@ class TranslateRequest(BaseModel):
 class TranslateResponse(BaseModel):
     translation: str
     example: str
+    example_translation: str
 
 
 # ---------- Вспомогательные функции ----------
@@ -221,22 +222,25 @@ def call_openai_chat(req: ChatRequest, partner_name: str) -> ChatResponse:
 
 def call_openai_translate(language: str, word: str) -> TranslateResponse:
     """
-    Перевод одного слова/фразы на русский + пример.
+    Перевод одного слова/фразы на русский + пример и перевод примера.
     Ответ тоже в JSON.
     """
 
     system_prompt = f"""
 You are a translator.
 Your task: translate ONE word or a very short phrase from {language} to Russian
-and give ONE short example sentence in {language} with this word.
+and give ONE short example sentence in {language} with this word,
+AND also provide a Russian translation of this example sentence.
 
 Answer STRICTLY as JSON, without any extra text:
 
 {{
   "translation": "перевод на русский",
-  "example": "short example sentence in {language} with this word"
+  "example": "short example sentence in {language} with this word",
+  "example_translation": "перевод этого примера на русский"
 }}
 """.strip()
+
 
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -247,23 +251,33 @@ Answer STRICTLY as JSON, without any extra text:
         temperature=0.3,
     )
 
-    content = completion.choices[0].message.content or ""
+    content = completion.choices[0].message.content.strip()
 
-    translation = ""
-    example = ""
     try:
         data = json.loads(content)
         translation = str(data.get("translation", "")).strip()
         example = str(data.get("example", "")).strip()
+        example_translation = str(data.get("example_translation", "")).strip()
     except Exception:
         # fallback: просто отдать весь текст в перевод
         translation = content.strip()
         example = ""
+        example_translation = ""
 
     if not translation:
         translation = word
 
-    return TranslateResponse(translation=translation, example=example)
+    # если по какой-то причине модель не дала перевод примера,
+    # но дала сам пример, чтобы не было пустоты
+    if not example_translation:
+        example_translation = "перевод примера не указан"
+
+    return TranslateResponse(
+        translation=translation,
+        example=example,
+        example_translation=example_translation,
+    )
+
 
 
 # ---------- FastAPI приложение ----------
