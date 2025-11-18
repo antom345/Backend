@@ -4,45 +4,45 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Literal
+from openai import OpenAI
+import os
 import json
 
-from openai import OpenAI
 
-
-# ---------- Настройки OpenAI ----------
+# ---------- OpenAI клиент ----------
 
 # Ключ должен быть в переменной окружения OPENAI_API_KEY
-# пример: export OPENAI_API_KEY="sk-...."
+# Пример: export OPENAI_API_KEY="sk-...."
 client = OpenAI()
 
 
-# ---------- Pydantic модели ----------
+# ---------- Pydantic-модели ----------
 
 class Message(BaseModel):
-    role: str   # "user" или "assistant"
+    role: Literal["user", "assistant"]
     content: str
 
 
 class ChatRequest(BaseModel):
-    messages: List[Message]
-    language: str = "English"           # язык общения
-    level: str = "B1"                   # A1–C2
-    user_gender: Optional[str] = None   # "male" / "female" / None
-    partner_gender: Optional[str] = None
+    messages: List[Message] = []
+    language: Optional[str] = "English"
+    level: Optional[str] = "B1"              # A1–C2
+    topic: Optional[str] = "General conversation"
+    user_gender: Optional[str] = "unspecified"   # "male" / "female" / "unspecified"
     user_age: Optional[int] = None
-    topic: str = "General conversation" # тема диалога
+    partner_gender: Optional[str] = "female"     # "male" / "female"
 
 
 class ChatResponse(BaseModel):
     reply: str
+    corrections_text: str
     partner_name: str
-    corrections: Optional[str] = None   # отдельный блок с ошибками (может быть null)
 
 
 class TranslateRequest(BaseModel):
     word: str
-    language: str = "English"
+    language: Optional[str] = "English"
 
 
 class TranslateResponse(BaseModel):
@@ -50,164 +50,229 @@ class TranslateResponse(BaseModel):
     example: str
 
 
-class TopicsRequest(BaseModel):
-    language: str = "English"
-    level: str = "B1"
-
-
-class TopicsResponse(BaseModel):
-    topics: List[str]
-
-
 # ---------- Вспомогательные функции ----------
 
-def get_partner_name(language: str, partner_gender: Optional[str]) -> str:
-    """
-    Подбираем имя собеседника под язык и пол.
-    """
-    lang = language.lower()
-    gender = (partner_gender or "").lower()
-
-    names: Dict[str, Dict[str, str]] = {
-        "english": {"female": "Emily", "male": "James"},
-        "german": {"female": "Lena", "male": "Lukas"},
-        "french": {"female": "Marie", "male": "Pierre"},
-        "spanish": {"female": "Sofia", "male": "Carlos"},
-        "italian": {"female": "Giulia", "male": "Luca"},
-        "korean": {"female": "Ji-eun", "male": "Min-jun"},
+def get_partner_name(language: str, partner_gender: str) -> str:
+    """Подбираем имя собеседника под язык и пол."""
+    female_names = {
+        "English": "Emily",
+        "German": "Anna",
+        "French": "Marie",
+        "Spanish": "Sofía",
+        "Italian": "Giulia",
+        "Korean": "Ji-woo",
+    }
+    male_names = {
+        "English": "Jack",
+        "German": "Lukas",
+        "French": "Pierre",
+        "Spanish": "Carlos",
+        "Italian": "Luca",
+        "Korean": "Min-jun",
     }
 
-    by_lang = names.get(lang)
-    if by_lang:
-        if gender in by_lang:
-            return by_lang[gender]
-        # если пол не указан — берём первое имя
-        return list(by_lang.values())[0]
-
-    # запасной вариант
-    return "Alex"
+    if partner_gender == "male":
+        return male_names.get(language, "Alex")
+    else:
+        return female_names.get(language, "Emily")
 
 
-def create_system_prompt(
-    language: str,
-    level: str,
-    user_gender: Optional[str],
-    partner_gender: Optional[str],
-    user_age: Optional[int],
-    partner_name: str,
-    topic: str,
-) -> str:
-    """
-    Создаёт системный промпт, который описывает поведение собеседника.
-    """
-
-    level = level.upper()
-    if level not in ["A1", "A2", "B1", "B2", "C1", "C2"]:
-        level = "B1"
-
-    user_profile_parts = []
-    if user_gender:
-        user_profile_parts.append(f"gender: {user_gender}")
-    if user_age:
-        user_profile_parts.append(f"age: {user_age}")
-    user_profile = ", ".join(user_profile_parts) if user_profile_parts else "no extra profile info"
-
-    return f"""
-You are {partner_name}, a friendly and realistic native speaker of {language}.
-You are chatting with a Russian learner of {language}.
-The user profile: {user_profile}.
-Stay in character as a real person, not as an AI or language model.
-
-MAIN ROLE:
-- You are a CONVERSATION PARTNER, not a general assistant.
-- Keep the dialogue natural and engaging.
-- Ask interesting follow-up questions connected to the topic.
-- Do not talk about prompts, tokens, or AI stuff.
-- Never say things like "as an AI" or "as a language model".
-
-LANGUAGE & LEVEL:
-- Conversation language: {language}.
-- Approximate level of the learner: {level}.
-- Adjust your vocabulary and grammar difficulty to this level.
-  * A1–A2: very simple words and short sentences.
-  * B1–B2: everyday vocabulary, natural but not too complex.
-  * C1–C2: natural, rich language but still clear.
-
-TOPIC:
-- Main topic: {topic}.
-- Keep most questions and comments related to this topic,
-  but you may naturally connect it to everyday life and emotions.
-
-STYLE:
-- Write normal text with spaces between words (no joined words).
-- Answers should be short and conversational: usually 1–3 sentences.
-- Vary your questions so the dialogue feels alive and personal.
-- Sometimes share a short opinion or small story about yourself.
-
-ERROR CORRECTION:
-- Your second task is to correct the learner's mistakes.
-- Focus on important grammar, word choice and unnatural phrases.
-- Ignore small things like capitalization or minor punctuation.
-- When you correct, be clear and specific:
-  * show the incorrect fragment,
-  * show the corrected version,
-  * optionally give a short Russian explanation.
-- If there are no important mistakes, say that there are no serious errors.
-
-OUTPUT FORMAT (VERY IMPORTANT):
-Always answer in this exact structure, in English (or in the target language + Russian explanations):
-
-REPLY: <your natural reply to the user>
-
-CORRECTIONS: <corrections list OR "No major mistakes.">
-
-Rules:
-- Keep the word REPLY: and CORRECTIONS: exactly like this in English.
-- Use normal spaces between all words.
-- Do not add any other sections or headings.
-"""
-
-
-def build_topics(language: str, level: str) -> List[str]:
-    """
-    Немного разных тем в зависимости от языка / уровня.
-    Можно потом расширять.
-    """
-    lang = language.lower()
-    level = level.upper()
-
-    generic = [
-        "Daily routine",
-        "Studies and work",
-        "Travel and holidays",
+def topics_for_language(language: str) -> List[str]:
+    """Список готовых топиков для выбора во фронтенде."""
+    base_topics = [
+        "Daily life",
         "Friends and relationships",
+        "Studies and university",
+        "Work and career",
+        "Travel and countries",
         "Hobbies and free time",
-        "Food and cooking",
+        "Movies, books and music",
         "Plans for the future",
     ]
 
-    if lang in ["english", "german", "french", "spanish", "italian", "korean"]:
-        topics = generic.copy()
-        if level in ["B2", "C1", "C2"]:
-            topics.extend([
-                "Cultural differences",
-                "Social media and technology",
-                "Big life decisions",
-                "Dream job and career paths",
-            ])
-        return topics
+    # Можно при желании делать локализацию,
+    # пока просто возвращаем один и тот же список
+    return base_topics
 
-    return generic
+
+def build_system_prompt(req: ChatRequest) -> str:
+    """
+    Системный промпт: описывает поведение собеседника
+    и формат JSON-ответа.
+    """
+
+    lang = req.language or "English"
+    topic = req.topic or "General conversation"
+    level = req.level or "B1"
+
+    user_gender = (req.user_gender or "unspecified").lower()
+    user_age = req.user_age
+    partner_gender = (req.partner_gender or "female").lower()
+
+    partner_gender_text = "a woman" if partner_gender == "female" else "a man"
+
+    profile_bits = []
+    if user_gender != "unspecified":
+        profile_bits.append(f"user gender: {user_gender}")
+    if user_age is not None:
+        profile_bits.append(f"user age: {user_age}")
+    profile_text = ", ".join(profile_bits) if profile_bits else "no extra profile data"
+
+    return f"""
+You are a friendly {partner_gender_text} who is a native speaker of {lang}.
+You are chatting with a learner in a NATURAL, realistic way, like a new friend,
+NOT like a generic assistant or AI model.
+
+User profile: {profile_text}
+User level in this language: {level} (A1–C2 scale).
+
+Your main goals:
+- Keep the conversation casual, personal and interesting.
+- Stay in character as a real person at all times. Never say that you are an AI or a language model.
+- Always reply ONLY in {lang}. Do not switch to other languages.
+- Keep replies short and conversational (1–3 sentences).
+- Ask questions sometimes, but not after every single message.
+- If the user writes something off-topic, you may gently bring the conversation back to the main topic,
+  but in a natural way.
+
+ERROR CORRECTION RULES (VERY IMPORTANT):
+
+- For EVERY user message you MUST check grammar, word choice and word order carefully.
+- If there is AT LEAST ONE non-trivial mistake (for example:
+  "I likes bananas", wrong preposition, wrong verb form, missing article,
+  wrong word order, wrong tense, etc.), you MUST add corrections to
+  the field "corrections_text".
+- Write all corrections in Russian.
+- Use this style for corrections_text:
+
+  "1) I likes bananas → I like bananas (ошибка в согласовании подлежащего и сказуемого)."
+  "2) He live in London → He lives in London (ошибка в форме глагола)."
+
+- DO NOT mix corrections into the main reply. The main reply should be a normal,
+  natural answer in {lang}.
+- If the user's message is completely correct and there are NO meaningful errors,
+  set corrections_text to an empty string "".
+
+Conversation topic: {topic}.
+
+FIRST MESSAGE RULE:
+
+- If there are NO user messages yet (messages array is empty),
+  you should START the conversation yourself with a simple engaging question
+  related to the topic. Still use the same JSON format.
+
+VERY IMPORTANT OUTPUT FORMAT:
+
+You MUST answer STRICTLY as JSON, no extra text, no explanations.
+The JSON format is:
+
+{{
+  "reply": "your short answer in {lang}",
+  "corrections_text": "краткий список исправлений на русском или пустая строка"
+}}
+""".strip()
+
+
+def call_openai_chat(req: ChatRequest, partner_name: str) -> ChatResponse:
+    """
+    Вызывает OpenAI Chat Completions и парсит JSON-ответ.
+    """
+
+    system_prompt = build_system_prompt(req)
+
+    history_messages = [
+        {"role": msg.role, "content": msg.content}
+        for msg in req.messages
+    ]
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history_messages)
+
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.4,
+    )
+
+    content = completion.choices[0].message.content or ""
+
+    # Пытаемся распарсить JSON, как мы попросили в промпте
+    reply_text = ""
+    corrections_text = ""
+
+    try:
+        data = json.loads(content)
+        reply_text = str(data.get("reply", "")).strip()
+        corrections_text = str(data.get("corrections_text", "")).strip()
+    except Exception:
+        # если модель вдруг ответила не JSON
+        reply_text = content.strip()
+        corrections_text = ""
+
+    if not reply_text:
+        reply_text = "Sorry, something went wrong. Could you write that again?"
+
+    return ChatResponse(
+        reply=reply_text,
+        corrections_text=corrections_text,
+        partner_name=partner_name,
+    )
+
+
+def call_openai_translate(language: str, word: str) -> TranslateResponse:
+    """
+    Перевод одного слова/фразы на русский + пример.
+    Ответ тоже в JSON.
+    """
+
+    system_prompt = f"""
+You are a translator.
+Your task: translate ONE word or a very short phrase from {language} to Russian
+and give ONE short example sentence in {language} with this word.
+
+Answer STRICTLY as JSON, without any extra text:
+
+{{
+  "translation": "перевод на русский",
+  "example": "short example sentence in {language} with this word"
+}}
+""".strip()
+
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": word},
+        ],
+        temperature=0.3,
+    )
+
+    content = completion.choices[0].message.content or ""
+
+    translation = ""
+    example = ""
+    try:
+        data = json.loads(content)
+        translation = str(data.get("translation", "")).strip()
+        example = str(data.get("example", "")).strip()
+    except Exception:
+        # fallback: просто отдать весь текст в перевод
+        translation = content.strip()
+        example = ""
+
+    if not translation:
+        translation = word
+
+    return TranslateResponse(translation=translation, example=example)
 
 
 # ---------- FastAPI приложение ----------
 
 app = FastAPI(title="Language Tutor Backend")
 
-# Разрешаем CORS (чтобы можно было обращаться из Flutter-приложения и т.п.)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # при желании можно ограничить
+    allow_origins=["*"],   # при желании можно сузить
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -218,161 +283,33 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    """
-    Простой эндпоинт для проверки, что сервер жив.
-    """
     return {"status": "ok"}
 
 
-@app.post("/topics", response_model=TopicsResponse)
-async def topics_endpoint(payload: TopicsRequest):
-    """
-    Возвращает список возможных тем для выбранного языка и уровня.
-    """
-    topics = build_topics(payload.language, payload.level)
-    return TopicsResponse(topics=topics)
+@app.get("/topics")
+async def get_topics(language: str = "English"):
+    return {
+        "language": language,
+        "topics": topics_for_language(language),
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(payload: ChatRequest):
-    """
-    Основной эндпоинт для диалога.
-    Клиент отправляет историю сообщений, параметры пользователя,
-    язык, уровень и тему.
-    Сервер добавляет системный промпт и обращается к OpenAI.
-    """
-
-    partner_name = get_partner_name(payload.language, payload.partner_gender)
-
-    system_prompt = create_system_prompt(
-        language=payload.language,
-        level=payload.level,
-        user_gender=payload.user_gender,
-        partner_gender=payload.partner_gender,
-        user_age=payload.user_age,
-        partner_name=partner_name,
-        topic=payload.topic,
-    )
-
-    # История сообщений в формате OpenAI
-    history_messages = [
-        {"role": msg.role, "content": msg.content}
-        for msg in payload.messages
-    ]
-
-    # Если история пустая — просим модель начать диалог первой
-    if not history_messages:
-        history_messages.append({
-            "role": "user",
-            "content": (
-                "Start the conversation with me according to the instructions. "
-                "Ask an engaging first question about the main topic."
-            ),
-        })
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history_messages)
-
-    # Запрос к OpenAI Chat Completions
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-    )
-
-    raw_text = response.choices[0].message.content.strip()
-
-    # Парсим структуру REPLY / CORRECTIONS
-    reply_text = raw_text
-    corrections_text: Optional[str] = None
-
-    upper = raw_text.upper()
-    if "REPLY:" in upper and "CORRECTIONS:" in upper:
-        # пытаемся выделить части
-        # сначала найдём позицию "REPLY:" и "CORRECTIONS:"
-        idx_reply = upper.index("REPLY:")
-        idx_corr = upper.index("CORRECTIONS:")
-
-        reply_part = raw_text[idx_reply:idx_corr]
-        corr_part = raw_text[idx_corr:]
-
-        reply_text = reply_part.replace("REPLY:", "", 1).strip()
-        corrections_text = corr_part.replace("CORRECTIONS:", "", 1).strip()
-
-        # Если модель написала, что ошибок нет, возвращаем None
-        if corrections_text.lower() in [
-            "no mistakes.",
-            "no major mistakes.",
-            "no major mistakes",
-            "no important mistakes.",
-            "no important mistakes",
-            "нет серьёзных ошибок.",
-            "нет серьёзных ошибок",
-        ]:
-            corrections_text = None
-
-    return ChatResponse(
-        reply=reply_text,
-        partner_name=partner_name,
-        corrections=corrections_text,
-    )
+    partner_name = get_partner_name(payload.language or "English",
+                                    payload.partner_gender or "female")
+    return call_openai_chat(payload, partner_name)
 
 
-@app.post("/translate_word", response_model=TranslateResponse)
+@app.post("/translate-word", response_model=TranslateResponse)
 async def translate_word_endpoint(payload: TranslateRequest):
-    """
-    Перевод отдельного слова + пример предложения.
-    """
-    word = payload.word.strip()
-    language = payload.language
-
-    if not word:
-        return TranslateResponse(translation="", example="")
-
-    system_prompt = f"""
-You are a bilingual dictionary for Russian speakers who learn {language}.
-For the given word or short phrase in {language}:
-
-- Give a natural Russian translation (1–3 words).
-- Give ONE short example sentence in {language} that shows how to use this word.
-- Use normal spaces between words.
-- Answer ONLY in valid JSON with keys "translation" and "example".
-Example:
-
-{{"translation": "пример", "example": "This is an example sentence."}}
-"""
-
-    user_message = f'WORD: "{word}"\nLANGUAGE: {language}'
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-    )
-
-    content = response.choices[0].message.content.strip()
-
-    translation = ""
-    example = ""
-
-    # Пытаемся распарсить JSON из ответа
-    try:
-        data = json.loads(content)
-        translation = str(data.get("translation", "")).strip()
-        example = str(data.get("example", "")).strip()
-    except Exception:
-        # если модель вдруг не вернула JSON — просто возвращаем текст как перевод
-        translation = content
-        example = ""
-
-    return TranslateResponse(translation=translation, example=example)
+    lang = payload.language or "English"
+    return call_openai_translate(lang, payload.word)
 
 
-# ---------- Точка входа (локальный запуск) ----------
+# ---------- Локальный запуск ----------
 
 if __name__ == "__main__":
     import uvicorn
 
-    # Запуск сервера: 0.0.0.0:8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
