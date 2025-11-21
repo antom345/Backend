@@ -8,30 +8,44 @@ from typing import List, Optional, Literal
 from openai import OpenAI
 import os
 import json
+import base64
+import requests
 
 
 # ---------- OpenAI клиент ----------
 
 # Ключ должен быть в переменной окружения OPENAI_API_KEY
 # Пример: export OPENAI_API_KEY="sk-...."
-client = OpenAI()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+app = FastAPI()
+
+# Разрешаем запросы с фронтенда (Flutter Web / мобильный)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # при желании можно сузить до конкретных доменов
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# ---------- Pydantic-модели ----------
+# ---------- Модели запросов/ответов ----------
 
-class Message(BaseModel):
+
+class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
 
 
 class ChatRequest(BaseModel):
-    messages: List[Message] = []
-    language: Optional[str] = "English"
+    language: str
     level: Optional[str] = "B1"              # A1–C2
     topic: Optional[str] = "General conversation"
     user_gender: Optional[str] = "unspecified"   # "male" / "female" / "unspecified"
     user_age: Optional[int] = None
     partner_gender: Optional[str] = "female"     # "male" / "female"
+    messages: List[ChatMessage]
 
 
 class ChatResponse(BaseModel):
@@ -49,9 +63,84 @@ class TranslateResponse(BaseModel):
     translation: str
     example: str
     example_translation: str
+    # base64-encoded audio (mp3) for the word pronunciation
+    audio_base64: Optional[str] = None
 
 
 # ---------- Вспомогательные функции ----------
+
+def lemonfox_language_code(language: str) -> str:
+    """Map app language name to Lemonfox TTS language code."""
+    lang = (language or "").lower()
+
+    if "english" in lang:
+        return "en-us"
+    if "french" in lang:
+        return "fr"
+    if "spanish" in lang:
+        return "es"
+    if "italian" in lang:
+        return "it"
+    if "portuguese" in lang or "português" in lang:
+        return "pt-br"
+    if "hindi" in lang:
+        return "hi"
+    if "chinese" in lang or "mandarin" in lang:
+        return "zh"
+    if "japanese" in lang:
+        return "ja"
+
+    # fallback: American English
+    return "en-us"
+
+def lemonfox_voice_for_lang(lang_code: str) -> str:
+    """
+    Подбираем голос Lemonfox под язык.
+    en-us / en-gb -> heart (английский)
+    es           -> dora (испанский)
+    pt-br        -> clara (португальский)
+    остальные пока тем же heart.
+    """
+    code = (lang_code or "en-us").lower()
+
+    if code in ("en-us", "en-gb"):
+        return "heart"   # английский
+
+    if code == "es":
+        return "dora"    # испанский голос
+
+    if code == "pt-br":
+        return "clara"   # бразильский португальский
+
+    # fr / it / zh / ja / hi и т.д. — пока общим голосом
+    return "heart"
+
+
+
+def lemonfox_voice_code(language_code: str) -> str:
+    """
+    Pick a Lemonfox voice that matches the language.
+    Docs: voices heart/bella/michael... are en-us,
+    dora/alex are Spanish, clara/tiago are Portuguese. :contentReference[oaicite:1]{index=1}
+    """
+    code = (language_code or "en-us").lower()
+
+    # Американский / британский английский
+    if code in ("en-us", "en-gb"):
+        return "heart"
+
+    # Испанский
+    if code == "es":
+        return "dora"   # или 'alex'
+
+    # Бразильский португальский
+    if code == "pt-br":
+        return "clara"  # или 'tiago'
+
+    # Для остальных (fr, it, hi, zh, ja) используем дефолтный голос,
+    # модель там всё равно мультиязычная
+    return "heart"
+
 
 def get_partner_name(language: str, partner_gender: str) -> str:
     """Подбираем имя собеседника под язык и пол."""
@@ -75,7 +164,69 @@ def get_partner_name(language: str, partner_gender: str) -> str:
     if partner_gender == "male":
         return male_names.get(language, "Alex")
     else:
-        return female_names.get(language, "Emily")
+        return female_names.get(language, "Alex")
+
+
+def build_system_prompt(
+    language: str,
+    level: Optional[str],
+    topic: Optional[str],
+    user_gender: Optional[str],
+    user_age: Optional[int],
+    partner_gender: Optional[str],
+    partner_name: str,
+) -> str:
+    """Формируем system prompt для беседы с учетом параметров пользователя."""
+    lang = language or "English"
+    level = level or "B1"
+    topic = topic or "General conversation"
+    partner_gender = partner_gender or "female"
+
+    if user_gender in ("male", "female"):
+        user_gender_text = user_gender
+    else:
+        user_gender_text = "unspecified"
+
+    age_text = f"{user_age} years old" if user_age else "age unspecified"
+
+    if partner_gender == "male":
+        partner_gender_text = "male friend"
+    else:
+        partner_gender_text = "female friend"
+
+    profile_text = (
+        f"The user is {age_text}, gender: {user_gender_text}. "
+        f"They are learning {lang} at level {level}. Preferred topic: {topic}."
+    )
+
+    return f"""
+You are a friendly {partner_gender_text} who is a native speaker of {lang}.
+You are chatting with a learner in a NATURAL, realistic way, like a new friend,
+NOT like a generic assistant or AI model.
+
+User profile: {profile_text}
+User level in this language: {level} (A1–C2 scale).
+
+Your main goals:
+- Keep the conversation casual, personal and interesting.
+- Stay in character as a real person at all times. Never say that you are an AI or a language model.
+- Always reply ONLY in {lang}. Do not switch to other languages.
+- Keep replies short and conversational (1–3 sentences).
+- Ask questions sometimes, but not after every single message.
+- If the user writes something off-topic, you may gently bring the conversation back to the main topic
+  ({topic}), but do it naturally.
+
+VERY IMPORTANT:
+1) Besides your reply, you must also provide corrections and explanations for the user's last message.
+2) If there are any mistakes (grammar, vocabulary, word order, etc.), correct them and explain very briefly.
+3) If there are no important mistakes, still give the user 1–2 small suggestions how to sound more natural.
+
+Respond STRICTLY as valid JSON with two fields:
+{{
+  "reply": "your short reply in {lang}",
+  "corrections_text": "short corrections and tips in {lang} (or partly in user's native language if needed)"
+}}
+"""
 
 
 def topics_for_language(language: str) -> List[str]:
@@ -96,90 +247,18 @@ def topics_for_language(language: str) -> List[str]:
     return base_topics
 
 
-def build_system_prompt(req: ChatRequest) -> str:
-    """
-    Системный промпт: описывает поведение собеседника
-    и формат JSON-ответа.
-    """
-
-    lang = req.language or "English"
-    topic = req.topic or "General conversation"
-    level = req.level or "B1"
-
-    user_gender = (req.user_gender or "unspecified").lower()
-    user_age = req.user_age
-    partner_gender = (req.partner_gender or "female").lower()
-
-    partner_gender_text = "a woman" if partner_gender == "female" else "a man"
-
-    profile_bits = []
-    if user_gender != "unspecified":
-        profile_bits.append(f"user gender: {user_gender}")
-    if user_age is not None:
-        profile_bits.append(f"user age: {user_age}")
-    profile_text = ", ".join(profile_bits) if profile_bits else "no extra profile data"
-
-    return f"""
-You are a friendly {partner_gender_text} who is a native speaker of {lang}.
-You are chatting with a learner in a NATURAL, realistic way, like a new friend,
-NOT like a generic assistant or AI model.
-
-User profile: {profile_text}
-User level in this language: {level} (A1–C2 scale).
-
-Your main goals:
-- Keep the conversation casual, personal and interesting.
-- Stay in character as a real person at all times. Never say that you are an AI or a language model.
-- Always reply ONLY in {lang}. Do not switch to other languages.
-- Keep replies short and conversational (1–3 sentences).
-- Ask questions sometimes, but not after every single message.
-- If the user writes something off-topic, you may gently bring the conversation back to the main topic,
-  but in a natural way.
-
-ERROR CORRECTION RULES (VERY IMPORTANT):
-
-- For EVERY user message you MUST check grammar, word choice and word order carefully.
-- If there is AT LEAST ONE non-trivial mistake (for example:
-  "I likes bananas", wrong preposition, wrong verb form, missing article,
-  wrong word order, wrong tense, etc.), you MUST add corrections to
-  the field "corrections_text".
-- Write all corrections in Russian.
-- Use this style for corrections_text:
-
-  "1) I likes bananas → I like bananas (ошибка в согласовании подлежащего и сказуемого)."
-  "2) He live in London → He lives in London (ошибка в форме глагола)."
-
-- DO NOT mix corrections into the main reply. The main reply should be a normal,
-  natural answer in {lang}.
-- If the user's message is completely correct and there are NO meaningful errors,
-  set corrections_text to an empty string "".
-
-Conversation topic: {topic}.
-
-FIRST MESSAGE RULE:
-
-- If there are NO user messages yet (messages array is empty),
-  you should START the conversation yourself with a simple engaging question
-  related to the topic. Still use the same JSON format.
-
-VERY IMPORTANT OUTPUT FORMAT:
-
-You MUST answer STRICTLY as JSON, no extra text, no explanations.
-The JSON format is:
-
-{{
-  "reply": "your short answer in {lang}",
-  "corrections_text": "краткий список исправлений на русском или пустая строка"
-}}
-""".strip()
-
-
-def call_openai_chat(req: ChatRequest, partner_name: str) -> ChatResponse:
-    """
-    Вызывает OpenAI Chat Completions и парсит JSON-ответ.
-    """
-
-    system_prompt = build_system_prompt(req)
+def call_openai_chat(req: ChatRequest) -> ChatResponse:
+    """Вызов OpenAI для чат-диалога с коррекциями."""
+    partner_name = get_partner_name(req.language, req.partner_gender or "female")
+    system_prompt = build_system_prompt(
+        language=req.language,
+        level=req.level,
+        topic=req.topic,
+        user_gender=req.user_gender,
+        user_age=req.user_age,
+        partner_gender=req.partner_gender,
+        partner_name=partner_name,
+    )
 
     history_messages = [
         {"role": msg.role, "content": msg.content}
@@ -223,7 +302,7 @@ def call_openai_chat(req: ChatRequest, partner_name: str) -> ChatResponse:
 def call_openai_translate(language: str, word: str) -> TranslateResponse:
     """
     Перевод одного слова/фразы на русский + пример и перевод примера.
-    Ответ тоже в JSON.
+    ПЛЮС озвучка слова через Lemonfox TTS.
     """
 
     system_prompt = f"""
@@ -236,21 +315,43 @@ Answer STRICTLY as JSON, without any extra text:
 
 {{
   "translation": "перевод на русский",
-  "example": "short example sentence in {language} with this word",
-  "example_translation": "перевод этого примера на русский"
+  "example": "пример предложения на {language}",
+  "example_translation": "перевод примера на русский"
 }}
-""".strip()
+"""
 
+    user_prompt = f"Word: {word}\nLanguage: {language}\nTarget: Russian"
 
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": word},
+            {"role": "user", "content": user_prompt},
         ],
-        temperature=0.3,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "wordData",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "translation": {"type": "string"},
+                        "example": {"type": "string"},
+                        "example_translation": {"type": "string"},
+                    },
+                    "required": [
+                        "translation",
+                        "example",
+                        "example_translation",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        temperature=0.2,
     )
 
+    # Здесь content уже должен быть JSON по схеме
     content = completion.choices[0].message.content.strip()
 
     try:
@@ -272,28 +373,52 @@ Answer STRICTLY as JSON, without any extra text:
     if not example_translation:
         example_translation = "перевод примера не указан"
 
+    # ---- Генерация озвучки через Lemonfox TTS ----
+    audio_b64: Optional[str] = None
+    try:
+        lf_api_key = os.getenv("LEMONFOX_API_KEY")
+        lf_lang = lemonfox_language_code(language)      # en-us / es / fr / it / pt-br ...
+        lf_voice = lemonfox_voice_for_lang(lf_lang)     # heart / dora / clara ...
+
+        print(f"[TTS] word={word!r}, ui_lang={language!r} -> lf_lang={lf_lang}, voice={lf_voice}")
+
+        if lf_api_key and word.strip():
+            tts_resp = requests.post(
+                "https://api.lemonfox.ai/v1/audio/speech",
+                headers={
+                    "Authorization": f"Bearer {lf_api_key}",
+                },
+                json={
+                    "input": word,
+                    "language": lf_lang,
+                    "voice": lf_voice,
+                    "response_format": "mp3",
+                },
+                timeout=10,
+            )
+            tts_resp.raise_for_status()
+            audio_bytes = tts_resp.content
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    except Exception as e:
+        print("TTS ERROR:", e)
+        # если озвучка не сработала, не ломаем весь ответ
+        audio_b64 = None
+
+
+
+
+
     return TranslateResponse(
         translation=translation,
         example=example,
         example_translation=example_translation,
+        audio_base64=audio_b64,
     )
 
 
 
-# ---------- FastAPI приложение ----------
+# ---------- Эндпоинты FastAPI ----------
 
-app = FastAPI(title="Language Tutor Backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # при желании можно сузить
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------- Эндпоинты ----------
 
 @app.get("/health")
 async def health_check():
@@ -312,13 +437,14 @@ async def get_topics(language: str = "English"):
 async def chat_endpoint(payload: ChatRequest):
     partner_name = get_partner_name(payload.language or "English",
                                     payload.partner_gender or "female")
-    return call_openai_chat(payload, partner_name)
+    return call_openai_chat(payload)
 
 
 @app.post("/translate-word", response_model=TranslateResponse)
 async def translate_word_endpoint(payload: TranslateRequest):
     lang = payload.language or "English"
     return call_openai_translate(lang, payload.word)
+
 
 
 # ---------- Локальный запуск ----------
