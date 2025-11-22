@@ -148,9 +148,14 @@ Your main goals:
   ({topic}), but do it naturally.
 
 VERY IMPORTANT:
-1) Besides your reply, you must also provide corrections and explanations for the user's last message.
-2) If there are any mistakes (grammar, vocabulary, word order, etc.), correct them and explain very briefly.
-3) If there are no important mistakes, still give the user 1–2 small suggestions how to sound more natural.
+1) You correct ONLY the learner's messages (messages with role "user").
+2) Never correct or comment on the AI assistant's messages (role "assistant"),
+   including your own previous replies.
+3) For each turn, give corrections ONLY for the learner's last message.
+4) If there are any mistakes (grammar, vocabulary, word order, etc.), correct them
+   and explain very briefly.
+5) If there are no important mistakes, still give the user 1–2 small suggestions
+   how to sound more natural.
 
 Respond STRICTLY as valid JSON with two fields:
 {{
@@ -196,6 +201,10 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
         for msg in req.messages
     ]
 
+    # Было ли хотя бы одно сообщение ученика?
+    has_user_message = any(msg.role == "user" for msg in req.messages)
+
+
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history_messages)
 
@@ -218,6 +227,11 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
     except Exception:
         # если модель вдруг ответила не JSON
         reply_text = content.strip()
+        corrections_text = ""
+
+    # Если ученик ещё ни разу не писал (только первое приветствие Эмили) —
+    # не показываем никаких исправлений
+    if not has_user_message:
         corrections_text = ""
 
     if not reply_text:
