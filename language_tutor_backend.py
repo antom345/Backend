@@ -212,7 +212,23 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
         model="gpt-4o-mini",
         messages=messages,
         temperature=0.4,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "chatReply",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "reply": {"type": "string"},
+                        "corrections_text": {"type": "string"},
+                    },
+                    "required": ["reply", "corrections_text"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     )
+
 
     content = completion.choices[0].message.content or ""
 
