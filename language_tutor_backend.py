@@ -69,77 +69,8 @@ class TranslateResponse(BaseModel):
 
 # ---------- Вспомогательные функции ----------
 
-def lemonfox_language_code(language: str) -> str:
-    """Map app language name to Lemonfox TTS language code."""
-    lang = (language or "").lower()
-
-    if "english" in lang:
-        return "en-us"
-    if "french" in lang:
-        return "fr"
-    if "spanish" in lang:
-        return "es"
-    if "italian" in lang:
-        return "it"
-    if "portuguese" in lang or "português" in lang:
-        return "pt-br"
-    if "hindi" in lang:
-        return "hi"
-    if "chinese" in lang or "mandarin" in lang:
-        return "zh"
-    if "japanese" in lang:
-        return "ja"
-
-    # fallback: American English
-    return "en-us"
-
-def lemonfox_voice_for_lang(lang_code: str) -> str:
-    """
-    Подбираем голос Lemonfox под язык.
-    en-us / en-gb -> heart (английский)
-    es           -> dora (испанский)
-    pt-br        -> clara (португальский)
-    остальные пока тем же heart.
-    """
-    code = (lang_code or "en-us").lower()
-
-    if code in ("en-us", "en-gb"):
-        return "heart"   # английский
-
-    if code == "es":
-        return "dora"    # испанский голос
-
-    if code == "pt-br":
-        return "clara"   # бразильский португальский
-
-    # fr / it / zh / ja / hi и т.д. — пока общим голосом
-    return "heart"
 
 
-
-def lemonfox_voice_code(language_code: str) -> str:
-    """
-    Pick a Lemonfox voice that matches the language.
-    Docs: voices heart/bella/michael... are en-us,
-    dora/alex are Spanish, clara/tiago are Portuguese. :contentReference[oaicite:1]{index=1}
-    """
-    code = (language_code or "en-us").lower()
-
-    # Американский / британский английский
-    if code in ("en-us", "en-gb"):
-        return "heart"
-
-    # Испанский
-    if code == "es":
-        return "dora"   # или 'alex'
-
-    # Бразильский португальский
-    if code == "pt-br":
-        return "clara"  # или 'tiago'
-
-    # Для остальных (fr, it, hi, zh, ja) используем дефолтный голос,
-    # модель там всё равно мультиязычная
-    return "heart"
 
 
 def get_partner_name(language: str, partner_gender: str) -> str:
@@ -302,9 +233,10 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
 def call_openai_translate(language: str, word: str) -> TranslateResponse:
     """
     Перевод одного слова/фразы на русский + пример и перевод примера.
-    ПЛЮС озвучка слова через Lemonfox TTS.
+    Озвучка слова через OpenAI TTS.
     """
 
+    # ---------- 1. Получаем перевод и пример через ChatGPT ----------
     system_prompt = f"""
 You are a translator.
 Your task: translate ONE word or a very short phrase from {language} to Russian
@@ -331,7 +263,7 @@ Answer STRICTLY as JSON, without any extra text:
         response_format={
             "type": "json_schema",
             "json_schema": {
-                "name": "wordData",
+                "name": "word_translation_with_example",
                 "schema": {
                     "type": "object",
                     "properties": {
@@ -351,7 +283,6 @@ Answer STRICTLY as JSON, without any extra text:
         temperature=0.2,
     )
 
-    # Здесь content уже должен быть JSON по схеме
     content = completion.choices[0].message.content.strip()
 
     try:
@@ -368,43 +299,35 @@ Answer STRICTLY as JSON, without any extra text:
     if not translation:
         translation = word
 
-    # если по какой-то причине модель не дала перевод примера,
-    # но дала сам пример, чтобы не было пустоты
     if not example_translation:
         example_translation = "перевод примера не указан"
 
-    # ---- Генерация озвучки через Lemonfox TTS ----
+    # ---- Генерация озвучки через OpenAI TTS (gpt-4o-mini-tts) ----
     audio_b64: Optional[str] = None
     try:
-        lf_api_key = os.getenv("LEMONFOX_API_KEY")
-        lf_lang = lemonfox_language_code(language)      # en-us / es / fr / it / pt-br ...
-        lf_voice = lemonfox_voice_for_lang(lf_lang)     # heart / dora / clara ...
+        text = (word or "").strip()
+        if text:
+            print(f"[TTS] OpenAI TTS for word={text!r}, language={language!r}")
 
-        print(f"[TTS] word={word!r}, ui_lang={language!r} -> lf_lang={lf_lang}, voice={lf_voice}")
-
-        if lf_api_key and word.strip():
-            tts_resp = requests.post(
-                "https://api.lemonfox.ai/v1/audio/speech",
-                headers={
-                    "Authorization": f"Bearer {lf_api_key}",
-                },
-                json={
-                    "input": word,
-                    "language": lf_lang,
-                    "voice": lf_voice,
-                    "response_format": "mp3",
-                },
-                timeout=10,
+            # БЕЗ format / response_format — твоя версия клиента этого не понимает
+            tts_response = client.audio.speech.create(
+                model="gpt-4o-mini-tts",
+                voice="alloy",
+                input=text,
             )
-            tts_resp.raise_for_status()
-            audio_bytes = tts_resp.content
+
+            # В разных версиях клиента ответ может быть либо байтами,
+            # либо объектом с методом .read() — обработаем оба варианта
+            audio_bytes = (
+                tts_response
+                if isinstance(tts_response, (bytes, bytearray))
+                else tts_response.read()
+            )
+
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
     except Exception as e:
-        print("TTS ERROR:", e)
-        # если озвучка не сработала, не ломаем весь ответ
+        print("TTS ERROR (OpenAI):", e)
         audio_b64 = None
-
-
 
 
 
@@ -414,6 +337,7 @@ Answer STRICTLY as JSON, without any extra text:
         example_translation=example_translation,
         audio_base64=audio_b64,
     )
+
 
 
 
