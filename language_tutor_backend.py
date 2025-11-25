@@ -1,7 +1,7 @@
 # backend_server.py
 # Backend для языкового собеседника (FastAPI + OpenAI)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Literal
@@ -10,6 +10,8 @@ import os
 import json
 import base64
 import requests
+from typing import Dict
+from io import BytesIO
 
 
 # ---------- OpenAI клиент ----------
@@ -52,6 +54,11 @@ class ChatResponse(BaseModel):
     reply: str
     corrections_text: str
     partner_name: str
+
+class STTResponse(BaseModel):
+    text: str          # распознанный текст
+    language: str      # язык, который мы ожидали
+
 
 
 class TranslateRequest(BaseModel):
@@ -152,10 +159,18 @@ VERY IMPORTANT:
 2) Never correct or comment on the AI assistant's messages (role "assistant"),
    including your own previous replies.
 3) For each turn, give corrections ONLY for the learner's last message.
-4) If there are any mistakes (grammar, vocabulary, word order, etc.), correct them
-   and explain very briefly.
-5) If there are no important mistakes, still give the user 1–2 small suggestions
-   how to sound more natural.
+4) The main field "reply" MUST be purely conversational and MUST NOT contain
+   any corrections, explanations of mistakes, or alternative phrasing.
+5) ALL corrections must go ONLY into the field "corrections_text".
+6) Correct ONLY real grammar/vocabulary/word-order mistakes or clearly
+   unnatural phrasing.
+7) Do NOT correct capitalization (e.g. "london" vs "London", "i" vs "I")
+   and do NOT correct punctuation when it does not change the meaning.
+8) If the learner's sentence is already natural and correct, set
+   "corrections_text" to an empty string and DO NOT suggest alternatives.
+9) Never repeat the same correction twice and never propose a sentence that is
+   identical to the learner's original sentence.
+
 
 Respond STRICTLY as valid JSON with two fields:
 {{
@@ -398,6 +413,44 @@ async def chat_endpoint(payload: ChatRequest):
 async def translate_word_endpoint(payload: TranslateRequest):
     lang = payload.language or "English"
     return call_openai_translate(lang, payload.word)
+
+
+@app.post("/stt", response_model=STTResponse)
+async def stt_endpoint(
+    language_code: str = "en",   # en, de, fr, es, it, ko, ru
+    file: UploadFile = File(...),
+):
+    """
+    Принимает аудиофайл, отправляет его в OpenAI на распознавание
+    и возвращает текст.
+    """
+    audio_bytes = await file.read()
+    print(f"[STT] len={len(audio_bytes)}, language_code={language_code}, filename={file.filename}")
+
+    text = ""
+
+    try:
+        # Делаем "файл" из байтов — так, как ждёт openai-клиент
+        audio_file = BytesIO(audio_bytes)
+        audio_file.name = file.filename or "input.m4a"
+
+        result = client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",
+            file=audio_file,
+            language=language_code,   # жёстко задаём язык
+        )
+
+        # В новой библиотеке у результата есть поле .text
+        text = getattr(result, "text", "") or ""
+        print("[STT] recognized:", text)
+
+    except Exception as e:
+        print("[STT] error:", e)
+
+    # Возвращаем нормальный объект, а не класс!
+    return STTResponse(text=text, language=language_code)
+
+
 
 
 
