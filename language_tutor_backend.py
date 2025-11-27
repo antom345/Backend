@@ -13,7 +13,6 @@ import requests
 from typing import Dict
 from io import BytesIO
 
-
 # ---------- OpenAI клиент ----------
 
 # Ключ должен быть в переменной окружения OPENAI_API_KEY
@@ -72,6 +71,68 @@ class TranslateResponse(BaseModel):
     example_translation: str
     # base64-encoded audio (mp3) for the word pronunciation
     audio_base64: Optional[str] = None
+
+
+class CoursePreferences(BaseModel):
+    """Параметры ученика для генерации плана курса."""
+    language: str                       # например: "English", "German"
+    level_hint: Optional[str] = None    # например: "A2", "beginner"
+    age: Optional[int] = None
+    gender: Optional[Literal["male", "female", "other"]] = None
+    goals: Optional[str] = None         # свободный текст: "переезд", "экзамен" и т.д.
+
+
+class Lesson(BaseModel):
+    """Один урок внутри уровня."""
+    id: str
+    title: str
+    type: Literal["dialog", "vocab", "grammar", "mixed"]
+    description: str
+
+
+class CourseLevel(BaseModel):
+    """Один уровень курса (ступень)."""
+    level_index: int                    # 1, 2, 3...
+    title: str
+    description: str
+    target_grammar: List[str]
+    target_vocab: List[str]
+    lessons: List[Lesson]
+
+
+class CoursePlan(BaseModel):
+    """Полный план курса из нескольких уровней."""
+    language: str
+    overall_level: str                  # например "A2", "B1"
+    levels: List[CourseLevel]
+
+
+
+class LessonRequest(BaseModel):
+    """Запрос на генерацию конкретного урока."""
+    language: str
+    level_hint: Optional[str] = None
+    lesson_title: str                 # название из CoursePlan
+    grammar_topics: Optional[List[str]] = None
+    vocab_topics: Optional[List[str]] = None
+
+
+class LessonExercise(BaseModel):
+    """Одно упражнение в уроке."""
+    id: str
+    type: Literal["multiple_choice"]  # для MVP делаем только тест с вариантами
+    question: str
+    options: List[str]
+    correct_index: int
+    explanation: str                  # короткое объяснение ответа
+
+
+class LessonContent(BaseModel):
+    """Контент целого урока: список упражнений."""
+    lesson_id: str
+    lesson_title: str
+    description: str
+    exercises: List[LessonExercise]
 
 
 # ---------- Вспомогательные функции ----------
@@ -451,6 +512,138 @@ async def stt_endpoint(
     return STTResponse(text=text, language=language_code)
 
 
+
+@app.post("/generate_course_plan", response_model=CoursePlan)
+def generate_course_plan(prefs: CoursePreferences):
+    """
+    Генерирует поуровневый план курса на основе предпочтений ученика.
+    Пока НИЧЕГО не сохраняем, просто отдаём план фронтенду.
+    """
+    system_prompt = """
+Ты методист по иностранным языкам и составляешь учебную программу.
+Нужно сделать поуровневый план курса для ученика.
+
+ДАЙ ОТВЕТ СТРОГО В ВИДЕ JSON СЛЕДУЮЩЕЙ СТРУКТУРЫ (БЕЗ ОБЪЯСНЕНИЙ ВНЕ JSON):
+
+{
+  "language": "...",
+  "overall_level": "...",
+  "levels": [
+    {
+      "level_index": 1,
+      "title": "...",
+      "description": "...",
+      "target_grammar": ["..."],
+      "target_vocab": ["..."],
+      "lessons": [
+        {
+          "id": "1-1",
+          "title": "...",
+          "type": "dialog | vocab | grammar | mixed",
+          "description": "..."
+        }
+      ]
+    }
+  ]
+}
+
+Требования:
+- 3–5 уровней.
+- В каждом уровне 3–6 уроков.
+- Описание и названия на английском языке (кроме language, там просто название языка).
+- Учитывай возраст, пол, цели и примерный уровень ученика.
+"""
+
+    # prefs.dict() превращаем в JSON-строку и отправляем как контекст
+    user_content = json.dumps(prefs.dict(), ensure_ascii=False)
+
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",  # или та модель, которую ты используешь
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Вот данные ученика в JSON:\n{user_content}"}
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = completion.choices[0].message.content or ""
+
+    try:
+        data = json.loads(content)
+    except Exception:
+        # на всякий случай, если модель сделает фигню
+        raise ValueError("Failed to parse course plan JSON from model")
+
+    # Pydantic сам проверит, что структура корректна
+    return CoursePlan(**data)
+
+
+@app.post("/generate_lesson", response_model=LessonContent)
+def generate_lesson(req: LessonRequest):
+    """
+    Генерирует набор упражнений для конкретного урока.
+    Упражнения: только multiple choice, чтобы было просто отрисовать на фронте.
+    """
+    system_prompt = """
+Ты преподаватель иностранного языка и создаёшь учебные упражнения.
+
+Нужно сделать НЕ ЧАТ, а СТРОГО СТРУКТУРИРОВАННЫЙ УРОК с 5–7 заданиями
+типа multiple choice по указанной теме, грамматике и лексике.
+
+ДАЙ ОТВЕТ СТРОГО В ВИДЕ JSON СЛЕДУЮЩЕЙ СТРУКТУРЫ (БЕЗ ТЕКСТА ВНЕ JSON):
+
+{
+  "lesson_id": "...",
+  "lesson_title": "...",
+  "description": "...",
+  "exercises": [
+    {
+      "id": "1",
+      "type": "multiple_choice",
+      "question": "...",
+      "options": ["...", "...", "..."],
+      "correct_index": 1,
+      "explanation": "краткое объяснение, почему этот вариант правильный"
+    }
+  ]
+}
+
+Требования:
+- 5–7 упражнений.
+- ONLY type = "multiple_choice".
+- Все варианты должны быть по целевому языку (кроме редких служебных слов).
+- В вопросах и вариантах используй указанную лексику и грамматику, когда это возможно.
+"""
+
+    user_payload = {
+        "language": req.language,
+        "level_hint": req.level_hint,
+        "lesson_title": req.lesson_title,
+        "grammar_topics": req.grammar_topics,
+        "vocab_topics": req.vocab_topics,
+    }
+
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",  # или твоя модель
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": "Данные урока в формате JSON:\n" + json.dumps(
+                    user_payload, ensure_ascii=False
+                ),
+            },
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = completion.choices[0].message.content or ""
+    try:
+        data = json.loads(content)
+    except Exception:
+        raise ValueError("Failed to parse lesson JSON from model")
+
+    return LessonContent(**data)
 
 
 
