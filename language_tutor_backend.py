@@ -63,6 +63,7 @@ class STTResponse(BaseModel):
 class TranslateRequest(BaseModel):
     word: str
     language: Optional[str] = "English"
+    with_audio: Optional[bool] = False
 
 
 class TranslateResponse(BaseModel):
@@ -170,74 +171,34 @@ def build_system_prompt(
     language: str,
     level: Optional[str],
     topic: Optional[str],
-    user_gender: Optional[str],
-    user_age: Optional[int],
     partner_gender: Optional[str],
     partner_name: str,
 ) -> str:
-    """Формируем system prompt для беседы с учетом параметров пользователя."""
+    """Короткий system prompt без лишних персональных деталей."""
     lang = language or "English"
     level = level or "B1"
     topic = topic or "General conversation"
     partner_gender = partner_gender or "female"
 
-    if user_gender in ("male", "female"):
-        user_gender_text = user_gender
-    else:
-        user_gender_text = "unspecified"
-
-    age_text = f"{user_age} years old" if user_age else "age unspecified"
-
     if partner_gender == "male":
-        partner_gender_text = "male friend"
+        partner_role = "male friend"
     else:
-        partner_gender_text = "female friend"
-
-    profile_text = (
-        f"The user is {age_text}, gender: {user_gender_text}. "
-        f"They are learning {lang} at level {level}. Preferred topic: {topic}."
-    )
+        partner_role = "female friend"
 
     return f"""
-You are a friendly {partner_gender_text} who is a native speaker of {lang}.
-You are chatting with a learner in a NATURAL, realistic way, like a new friend,
-NOT like a generic assistant or AI model.
+You talk to a {level} {lang} learner. Your character name is {partner_name}. You are a friendly {partner_role} and native {lang} speaker. Keep the chat casual about {topic}.
 
-User profile: {profile_text}
-User level in this language: {level} (A1–C2 scale).
+Rules:
+- Reply ONLY in {lang}, 1–3 sentences, natural and human-like.
+- Stay in character; never say you are an AI.
+- Correct ONLY the learner's last user message, never assistant messages.
+- Put conversation text in "reply" only; put all corrections in "corrections_text" only.
+- Correct grammar/word choice/word order; ignore capitalization and harmless punctuation.
+- If there are no real mistakes, set "corrections_text" to an empty string.
+- Do not repeat corrections or copy the user's original sentence.
 
-Your main goals:
-- Keep the conversation casual, personal and interesting.
-- Stay in character as a real person at all times. Never say that you are an AI or a language model.
-- Always reply ONLY in {lang}. Do not switch to other languages.
-- Keep replies short and conversational (1–3 sentences).
-- Ask questions sometimes, but not after every single message.
-- If the user writes something off-topic, you may gently bring the conversation back to the main topic
-  ({topic}), but do it naturally.
-
-VERY IMPORTANT:
-1) You correct ONLY the learner's messages (messages with role "user").
-2) Never correct or comment on the AI assistant's messages (role "assistant"),
-   including your own previous replies.
-3) For each turn, give corrections ONLY for the learner's last message.
-4) The main field "reply" MUST be purely conversational and MUST NOT contain
-   any corrections, explanations of mistakes, or alternative phrasing.
-5) ALL corrections must go ONLY into the field "corrections_text".
-6) Correct ONLY real grammar/vocabulary/word-order mistakes or clearly
-   unnatural phrasing.
-7) Do NOT correct capitalization (e.g. "london" vs "London", "i" vs "I")
-   and do NOT correct punctuation when it does not change the meaning.
-8) If the learner's sentence is already natural and correct, set
-   "corrections_text" to an empty string and DO NOT suggest alternatives.
-9) Never repeat the same correction twice and never propose a sentence that is
-   identical to the learner's original sentence.
-
-
-Respond STRICTLY as valid JSON with two fields:
-{{
-  "reply": "your short reply in {lang}",
-  "corrections_text": "short corrections and tips in {lang} (or partly in user's native language if needed)"
-}}
+Return STRICT JSON:
+{{"reply":"...","corrections_text":"..."}}
 """
 
 
@@ -266,8 +227,6 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
         language=req.language,
         level=req.level,
         topic=req.topic,
-        user_gender=req.user_gender,
-        user_age=req.user_age,
         partner_gender=req.partner_gender,
         partner_name=partner_name,
     )
@@ -276,6 +235,9 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
         {"role": msg.role, "content": msg.content}
         for msg in req.messages
     ]
+
+    # Берём только последние 5 сообщений, чтобы экономить токены
+    history_messages = history_messages[-5:]
 
     # Было ли хотя бы одно сообщение ученика?
     has_user_message = any(msg.role == "user" for msg in req.messages)
@@ -336,7 +298,11 @@ def call_openai_chat(req: ChatRequest) -> ChatResponse:
     )
 
 
-def call_openai_translate(language: str, word: str) -> TranslateResponse:
+def call_openai_translate(
+    language: str,
+    word: str,
+    include_audio: bool = False,
+) -> TranslateResponse:
     """
     Перевод одного слова/фразы на русский + пример и перевод примера.
     Озвучка слова через OpenAI TTS.
@@ -410,30 +376,31 @@ Answer STRICTLY as JSON, without any extra text:
 
     # ---- Генерация озвучки через OpenAI TTS (gpt-4o-mini-tts) ----
     audio_b64: Optional[str] = None
-    try:
-        text = (word or "").strip()
-        if text:
-            print(f"[TTS] OpenAI TTS for word={text!r}, language={language!r}")
+    if include_audio:
+        try:
+            text = (word or "").strip()
+            if text:
+                print(f"[TTS] OpenAI TTS for word={text!r}, language={language!r}")
 
-            # БЕЗ format / response_format — твоя версия клиента этого не понимает
-            tts_response = client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice="alloy",
-                input=text,
-            )
+                # БЕЗ format / response_format — твоя версия клиента этого не понимает
+                tts_response = client.audio.speech.create(
+                    model="gpt-4o-mini-tts",
+                    voice="alloy",
+                    input=text,
+                )
 
-            # В разных версиях клиента ответ может быть либо байтами,
-            # либо объектом с методом .read() — обработаем оба варианта
-            audio_bytes = (
-                tts_response
-                if isinstance(tts_response, (bytes, bytearray))
-                else tts_response.read()
-            )
+                # В разных версиях клиента ответ может быть либо байтами,
+                # либо объектом с методом .read() — обработаем оба варианта
+                audio_bytes = (
+                    tts_response
+                    if isinstance(tts_response, (bytes, bytearray))
+                    else tts_response.read()
+                )
 
-            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-    except Exception as e:
-        print("TTS ERROR (OpenAI):", e)
-        audio_b64 = None
+                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        except Exception as e:
+            print("TTS ERROR (OpenAI):", e)
+            audio_b64 = None
 
 
 
@@ -473,7 +440,11 @@ async def chat_endpoint(payload: ChatRequest):
 @app.post("/translate-word", response_model=TranslateResponse)
 async def translate_word_endpoint(payload: TranslateRequest):
     lang = payload.language or "English"
-    return call_openai_translate(lang, payload.word)
+    return call_openai_translate(
+        lang,
+        payload.word,
+        include_audio=bool(payload.with_audio),
+    )
 
 
 @app.post("/stt", response_model=STTResponse)
