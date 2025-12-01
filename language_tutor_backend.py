@@ -119,13 +119,40 @@ class LessonRequest(BaseModel):
 
 
 class LessonExercise(BaseModel):
-    """Одно упражнение в уроке."""
+    """
+    Одно упражнение в уроке.
+
+    type:
+      - multiple_choice      — выбор правильного варианта
+      - translate_sentence   — перевод предложения целиком
+      - fill_in_blank        — пропуск в предложении
+      - reorder_words        — расставить слова в правильном порядке
+    """
     id: str
-    type: Literal["multiple_choice"]  # для MVP делаем только тест с вариантами
-    question: str
-    options: List[str]
-    correct_index: int
-    explanation: str                  # короткое объяснение ответа
+    type: Literal[
+        "multiple_choice",
+        "translate_sentence",
+        "fill_in_blank",
+        "reorder_words",
+    ]
+
+    # Общие поля
+    question: str                          # что показываем пользователю (основный текст задания)
+    explanation: str                       # короткое объяснение / разбор
+
+    # Для multiple_choice
+    options: Optional[List[str]] = None    # варианты ответа
+    correct_index: Optional[int] = None    # индекс правильного варианта
+
+    # Для translate_sentence / fill_in_blank
+    correct_answer: Optional[str] = None   # правильный ответ / правильный перевод
+
+    # Для fill_in_blank
+    sentence_with_gap: Optional[str] = None  # строка с пропуском, например: "I ____ to school yesterday."
+
+    # Для reorder_words
+    reorder_words: Optional[List[str]] = None      # список слов в случайном порядке
+    reorder_correct: Optional[List[str]] = None    # тот же список, но в правильном порядке
 
 
 class LessonContent(BaseModel):
@@ -552,60 +579,136 @@ def generate_course_plan(prefs: CoursePreferences):
 @app.post("/generate_lesson", response_model=LessonContent)
 def generate_lesson(req: LessonRequest):
     """
-    Генерирует набор упражнений для конкретного урока.
-    Упражнения: только multiple choice, чтобы было просто отрисовать на фронте.
+    Генерирует набор УМНЫХ упражнений для конкретного урока.
+    Типы заданий: multiple_choice, translate_sentence, fill_in_blank, reorder_words.
     """
     system_prompt = """
-Ты преподаватель иностранного языка и создаёшь учебные упражнения.
+Ты опытный преподаватель иностранного языка и методист.
+Твоя задача — создать СТРУКТУРИРОВАННЫЙ УРОК с упражнениями наподобие Duolingo.
 
-Нужно сделать НЕ ЧАТ, а СТРОГО СТРУКТУРИРОВАННЫЙ УРОК с 5–7 заданиями
-типа multiple choice по указанной теме, грамматике и лексике.
+ВАЖНО:
+- НЕ вести диалог, а выдать СТРОГО JSON-структуру.
+- Урок должен быть связан с темой, уровнем и грамматикой/лексикой, которые я передам.
+- Количество заданий: 6–8.
+- Обязательно должны встретиться разные типы заданий: multiple_choice, translate_sentence, fill_in_blank, reorder_words.
+- Язык target — это язык, который изучает пользователь (например, English, German и т.д.).
+- Можно использовать исходный язык пользователя (например, Russian) для переводов, если это логично.
 
-ДАЙ ОТВЕТ СТРОГО В ВИДЕ JSON СЛЕДУЮЩЕЙ СТРУКТУРЫ (БЕЗ ТЕКСТА ВНЕ JSON):
+ТИПЫ ЗАДАНИЙ:
 
-{
-  "lesson_id": "...",
-  "lesson_title": "...",
-  "description": "...",
-  "exercises": [
-    {
-      "id": "1",
-      "type": "multiple_choice",
-      "question": "...",
-      "options": ["...", "...", "..."],
-      "correct_index": 1,
-      "explanation": "краткое объяснение, почему этот вариант правильный"
-    }
-  ]
-}
+1) multiple_choice
+   - Покажи пользователю вопрос (question).
+   - Дай 3–5 вариантов (options).
+   - Укажи индекс правильного ответа (correct_index).
+   - В explanation коротко объясни, почему ответ верный (на target языке или кратко на языке пользователя).
 
-Требования:
-- 5–7 упражнений.
-- ONLY type = "multiple_choice".
-- Все варианты должны быть по целевому языку (кроме редких служебных слов).
-- В вопросах и вариантах используй указанную лексику и грамматику, когда это возможно.
+2) translate_sentence
+   - В question выведи предложение на target языке ИЛИ на языке пользователя.
+   - Пользователь должен перевести его на другой язык (ты сам выбираешь направление, исходя из урока).
+   - В correct_answer запиши идеальный/ожидаемый перевод.
+   - В explanation объясни основные моменты (сложные слова, грамматику).
+
+3) fill_in_blank
+   - В sentence_with_gap сделай одно предложение target-языка с пропуском (например: "I ____ to school yesterday.").
+   - В question можно кратко указать инструкцию: "Заполни пропуск правильной формой глагола".
+   - В correct_answer укажи правильное слово/форму.
+   - В explanation объясни, почему именно такая форма.
+
+4) reorder_words
+   - В reorder_words укажи список слов в ПЕРЕМЕШАННОМ порядке.
+   - В reorder_correct укажи этот же список, но в ПРАВИЛЬНОМ порядке.
+   - В question можно написать: "Собери правильное предложение из слов".
+   - В explanation кратко объясни порядок слов, важные моменты.
+
+СТРОГО ВАЖНЫЕ ПРАВИЛА:
+- Выдай ТОЛЬКО JSON без комментариев и без дополнительного текста.
+- Следуй СТРОГО заданной схеме JSON (типы полей, обязательные поля).
+- Все строки должны быть валидными, без многоточий и без "..." внутри.
 """
 
+    # Что передаём в модель как входные данные для урока
     user_payload = {
         "language": req.language,
-        "level_hint": req.level_hint,
+        "level_hint": req.level_hint or "",
         "lesson_title": req.lesson_title,
-        "grammar_topics": req.grammar_topics,
-        "vocab_topics": req.vocab_topics,
+        "grammar_topics": req.grammar_topics or [],
+        "vocab_topics": req.vocab_topics or [],
     }
 
     completion = client.chat.completions.create(
-        model="gpt-4.1-mini",  # или твоя модель
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": "Данные урока в формате JSON:\n" + json.dumps(
-                    user_payload, ensure_ascii=False
-                ),
+                "content": "Сгенерируй урок по следующим параметрам:\n"
+                           + json.dumps(user_payload, ensure_ascii=False),
             },
         ],
-        response_format={"type": "json_object"},
+        temperature=0.4,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "lessonContent",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "lesson_id": {"type": "string"},
+                        "lesson_title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "exercises": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "multiple_choice",
+                                            "translate_sentence",
+                                            "fill_in_blank",
+                                            "reorder_words",
+                                        ],
+                                    },
+                                    "question": {"type": "string"},
+                                    "explanation": {"type": "string"},
+                                    "options": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "correct_index": {"type": "integer"},
+                                    "correct_answer": {"type": "string"},
+                                    "sentence_with_gap": {"type": "string"},
+                                    "reorder_words": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "reorder_correct": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "required": [
+                                    "id",
+                                    "type",
+                                    "question",
+                                    "explanation",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": [
+                        "lesson_id",
+                        "lesson_title",
+                        "description",
+                        "exercises",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
     )
 
     content = completion.choices[0].message.content or ""
